@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/docker/distribution/registry/storage/manager"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -23,10 +24,12 @@ import (
 )
 
 const (
-	driverName       = "cos"
-	listMax          = 1000
-	minChunkSize     = 1 << 20
-	defaultChunkSize = 2 * minChunkSize
+	driverName                   = "cos"
+	listMax                      = 1000
+	minChunkSize                 = 1 << 20
+	defaultChunkSize             = 2 * minChunkSize
+	defaultRootDirectory         = ""
+	defaultStorageManagerAddress = ""
 )
 
 const (
@@ -51,22 +54,24 @@ type Driver struct {
 }
 
 type driver struct {
-	Client        *cos.Client
-	SecretID      string
-	SecretKey     string
-	RootDirectory string
-	ChunkSize     int64
+	Client                *cos.Client
+	SecretID              string
+	SecretKey             string
+	RootDirectory         string
+	ChunkSize             int64
+	StorageManagerAddress string
 }
 
 //DriverParameters A struct that encapsulates all of the driver parameters after all values have been set
 type DriverParameters struct {
-	SecretID      string
-	SecretKey     string
-	Bucket        string
-	Region        string
-	Secure        bool
-	ChunkSize     int64
-	RootDirectory string
+	SecretID              string
+	SecretKey             string
+	Bucket                string
+	Region                string
+	Secure                bool
+	ChunkSize             int64
+	RootDirectory         string
+	StorageManagerAddress string
 }
 
 func init() {
@@ -108,9 +113,13 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	}
 
 	rootDir, ok := parameters["rootdir"]
-
 	if !ok {
-		rootDir = ""
+		rootDir = defaultRootDirectory
+	}
+
+	smAdress, ok := parameters["smaddress"]
+	if !ok {
+		smAdress = defaultStorageManagerAddress
 	}
 
 	secureBool := true
@@ -154,13 +163,14 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 	}
 
 	params := DriverParameters{
-		SecretID:      fmt.Sprint(secretID),
-		SecretKey:     fmt.Sprint(secretKey),
-		Bucket:        fmt.Sprint(bucket),
-		Region:        fmt.Sprint(regionName),
-		ChunkSize:     chunkSize,
-		Secure:        secureBool,
-		RootDirectory: fmt.Sprint(rootDir),
+		SecretID:              fmt.Sprint(secretID),
+		SecretKey:             fmt.Sprint(secretKey),
+		Bucket:                fmt.Sprint(bucket),
+		Region:                fmt.Sprint(regionName),
+		ChunkSize:             chunkSize,
+		Secure:                secureBool,
+		RootDirectory:         fmt.Sprint(rootDir),
+		StorageManagerAddress: fmt.Sprint(smAdress),
 	}
 
 	return New(params)
@@ -177,11 +187,12 @@ func New(params DriverParameters) (*Driver, error) {
 		},
 	})
 	d := &driver{
-		Client:        client,
-		SecretID:      params.SecretID,
-		SecretKey:     params.SecretKey,
-		RootDirectory: params.RootDirectory,
-		ChunkSize:     params.ChunkSize,
+		Client:                client,
+		SecretID:              params.SecretID,
+		SecretKey:             params.SecretKey,
+		RootDirectory:         params.RootDirectory,
+		ChunkSize:             params.ChunkSize,
+		StorageManagerAddress: params.StorageManagerAddress,
 	}
 	return &Driver{
 		baseEmbed: baseEmbed{
@@ -695,17 +706,42 @@ func toDir(s string) string {
 
 }
 
-func (d *driver) cosPath(ctx context.Context, p string) string {
+func getPrefix(ctx context.Context) string {
+	host := dcontext.GetStringValue(ctx, "http.request.host")
 
-	finalPath := getFinalPath(dcontext.GetStringValue(ctx, "http.request.host"), p)
+	chunks := strings.Split(host, ".")
 
-	finalPath = path.Join(d.RootDirectory, finalPath)
+	return chunks[0]
+}
 
-	if isDir(p) {
-		finalPath = toDir(finalPath)
+func (d *driver) resolvePath(before, after string) string {
+
+	after = path.Join(d.RootDirectory, after)
+
+	if isDir(before) {
+		after = toDir(after)
 	}
 
-	return strings.TrimLeft(finalPath, "/")
+	return strings.TrimLeft(after, "/")
+
+}
+
+func (d *driver) cosPath(subPath string, ctx context.Context) (string, error) {
+
+	if d.StorageManagerAddress != "" {
+
+		hashPath, err := manager.GetDockerStoragePath(d.StorageManagerAddress, dcontext.GetStringValue(ctx, "http.request.host"), subPath)
+
+		if err != nil {
+			return "", nil
+		}
+
+		return d.resolvePath(subPath, hashPath), nil
+
+	}
+
+	return d.resolvePath(subPath, path.Join(subPath, getPrefix(ctx))), nil
+
 }
 
 // copy copies an object stored at sourcePath to destPath.
