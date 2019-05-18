@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"path"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -208,23 +207,27 @@ func (d *driver) getContentType() string {
 }
 
 func (d *driver) GetContent(ctx context.Context, path string) ([]byte, error) {
+	fmt.Println("[INFO] get content:", path)
 
 	cosPath, err := d.cosPath(path, ctx)
 
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println("[INFO] get content cos path:", cosPath)
 
 	resp, err := d.Client.Object.Get(ctx, cosPath, nil)
 	if err != nil {
 		return nil, parseError(cosPath, err)
 	}
 	bs, _ := ioutil.ReadAll(resp.Body)
+	fmt.Println("[INFO] get content res:", path)
 	resp.Body.Close()
 	return bs, nil
 }
 
 func (d *driver) PutContent(ctx context.Context, path string, content []byte) error {
+	fmt.Println("[INFO] put content")
 	body := bytes.NewBuffer(content)
 	opt := &cos.ObjectPutOptions{
 		ACLHeaderOptions: &cos.ACLHeaderOptions{
@@ -253,11 +256,14 @@ func (d *driver) PutContent(ctx context.Context, path string, content []byte) er
 // with a given byte offset.
 // May be used to resume reading a stream by providing a nonzero offset.
 func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
+	fmt.Println("[INFO] reader:", path)
 	opt := &cos.ObjectGetOptions{
 		Range: "bytes=" + strconv.FormatInt(offset, 10) + "-",
 	}
 
 	cosPath, err := d.cosPath(path, ctx)
+
+	fmt.Println("[INFO] reader cos path:", path)
 
 	if err != nil {
 		return nil, err
@@ -267,11 +273,12 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 	if err != nil {
 		return nil, parseError(cosPath, err)
 	}
+	fmt.Println("[INFO] reader response:", path)
 	return resp.Body, nil
 }
 
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
-
+	fmt.Println("[INFO] writer")
 	key, err := d.cosPath(path, ctx)
 
 	if err != nil {
@@ -311,6 +318,7 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 }
 
 func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
+	fmt.Println("[INFO] list")
 	subPath := opath
 	if subPath != "/" && opath[len(subPath)-1] != '/' {
 		subPath = subPath + "/"
@@ -391,6 +399,7 @@ func (d *driver) List(ctx context.Context, opath string) ([]string, error) {
 }
 
 func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+	fmt.Println("[INFO] stat")
 
 	cosPath, err := d.cosPath(path, ctx)
 
@@ -434,6 +443,7 @@ func (d *driver) Stat(ctx context.Context, path string) (storagedriver.FileInfo,
 }
 
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
+	fmt.Println("[INFO] Move")
 	// need to implement multi-part upload
 	err := d.copy(ctx, sourcePath, destPath)
 	if err != nil {
@@ -454,6 +464,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 }
 
 func (d *driver) Delete(ctx context.Context, path string) error {
+	fmt.Println("[INFO] Delete")
 	cosPath, err := d.cosPath(path, ctx)
 
 	if err != nil {
@@ -514,11 +525,14 @@ func (d *driver) Delete(ctx context.Context, path string) error {
 }
 
 func (d *driver) URLFor(ctx context.Context, path string, options map[string]interface{}) (string, error) {
+	fmt.Println("[INFO] URL for")
 	methodString := "GET"
 	method, ok := options["method"]
 	if ok {
 		methodString, ok = method.(string)
-		if !ok || (methodString != "GET" && methodString != "HEAD") {
+		// FIXME: ignore HEAD method because the Docker Daemon version 18.09.2
+		// https://github.com/docker/distribution/issues/2649
+		if !ok || (methodString != "GET") {
 			return "", storagedriver.ErrUnsupportedMethod{}
 		}
 	}
@@ -549,6 +563,7 @@ func (d *driver) URLFor(ctx context.Context, path string, options map[string]int
 }
 
 func (d *driver) Walk(ctx context.Context, path string, f storagedriver.WalkFn) error {
+	fmt.Println("[INFO] walk")
 	return storagedriver.WalkFallback(ctx, d, path, f)
 }
 
@@ -590,49 +605,52 @@ func (w *writer) Write(p []byte) (int, error) {
 
 	// If the last written part is smaller than minChunkSize, we need to make a
 	// new multipart upload :sadface:
+	fmt.Println("[INFO] write:", len(p))
 	if len(w.parts) > 0 && int(w.parts[len(w.parts)-1].Size) < minChunkSize {
-		opt := &cos.CompleteMultipartUploadOptions{}
-		for _, p := range w.parts {
-			opt.Parts = append(opt.Parts, cos.Object{
-				PartNumber: p.PartNumber,
-				ETag:       p.ETag,
-			})
-		}
-		sort.Sort(cos.ObjectList(opt.Parts))
-		_, _, err := w.driver.Client.Object.CompleteMultipartUpload(context.Background(), w.key, w.uploadID, opt)
-
-		if err != nil {
-			w.driver.Client.Object.AbortMultipartUpload(context.Background(), w.key, w.uploadID)
-			return 0, err
-		}
-
-		v, _, err := w.driver.Client.Object.InitiateMultipartUpload(context.Background(), w.key, nil)
-		if err != nil {
-			return 0, err
-		}
-		w.uploadID = v.UploadID
-
-		// If the entire written file is smaller than minChunkSize, we need to make
-		// a new part from scratch :double sad face:
-		if w.size < minChunkSize {
-			resp, err := w.driver.Client.Object.Get(context.Background(), w.key, nil)
-			if err != nil {
-				return 0, err
-			}
-			defer resp.Body.Close()
-			w.parts = nil
-			w.readyPart, err = ioutil.ReadAll(resp.Body)
-			if err != nil {
-				return 0, err
-			}
-		} else {
-			// Otherwise we can use the old file as the new first part
-			part, _, err := w.driver.Client.Object.UploadPartCopy(context.Background(), v.Key, w.key, v.UploadID, 1, nil)
-			if err != nil {
-				return 0, err
-			}
-			w.parts = []cos.Object{part}
-		}
+		fmt.Println("[INFO] inner write:", len(p))
+		//opt := &cos.CompleteMultipartUploadOptions{}
+		//for _, p := range w.parts {
+		//	opt.Parts = append(opt.Parts, cos.Object{
+		//		PartNumber: p.PartNumber,
+		//		ETag:       p.ETag,
+		//	})
+		//}
+		//sort.Sort(cos.ObjectList(opt.Parts))
+		//_, _, err := w.driver.Client.Object.CompleteMultipartUpload(context.Background(), w.key, w.uploadID, opt)
+		//
+		//if err != nil {
+		//	w.driver.Client.Object.AbortMultipartUpload(context.Background(), w.key, w.uploadID)
+		//	return 0, err
+		//}
+		//
+		//v, _, err := w.driver.Client.Object.InitiateMultipartUpload(context.Background(), w.key, nil)
+		//if err != nil {
+		//	return 0, err
+		//}
+		//w.uploadID = v.UploadID
+		//
+		//// If the entire written file is smaller than minChunkSize, we need to make
+		//// a new part from scratch :double sad face:
+		//if w.size < minChunkSize {
+		//	resp, err := w.driver.Client.Object.Get(context.Background(), w.key, nil)
+		//	if err != nil {
+		//		return 0, err
+		//	}
+		//	defer resp.Body.Close()
+		//	w.parts = nil
+		//	w.readyPart, err = ioutil.ReadAll(resp.Body)
+		//	if err != nil {
+		//		return 0, err
+		//	}
+		//}
+		//} else {
+		//	// Otherwise we can use the old file as the new first part
+		//	part, _, err := w.driver.Client.Object.UploadPartCopy(context.Background(), v.Key, w.key, v.UploadID, 1, nil)
+		//	if err != nil {
+		//		return 0, err
+		//	}
+		//	w.parts = []cos.Object{part}
+		//}
 	}
 
 	var n int
@@ -653,6 +671,7 @@ func (w *writer) Write(p []byte) (int, error) {
 
 		if neededBytes := int(w.driver.ChunkSize) - len(w.pendingPart); neededBytes > 0 {
 			if len(p) >= neededBytes {
+				fmt.Println("[INFO] flush part")
 				w.pendingPart = append(w.pendingPart, p[:neededBytes]...)
 				n += neededBytes
 				p = p[neededBytes:]
@@ -696,6 +715,7 @@ func (w *writer) Cancel() error {
 }
 
 func (w *writer) Commit() error {
+	fmt.Println("[INFO] commit !!!")
 	if w.closed {
 		return fmt.Errorf("already closed")
 	} else if w.committed {
@@ -809,6 +829,7 @@ func (d *driver) cosPath(subPath string, ctx context.Context) (string, error) {
 
 // copy copies an object stored at sourcePath to destPath.
 func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) error {
+	fmt.Println("[INFO] copy")
 	fileInfo, err := d.Stat(ctx, sourcePath)
 	if err != nil {
 		return err
@@ -871,10 +892,14 @@ func (d *driver) copy(ctx context.Context, sourcePath string, destPath string) e
 			if lastByte >= fileInfo.Size() {
 				lastByte = fileInfo.Size() - 1
 			}
+			fmt.Println("[INFO] copy goroutine start")
+
 			uploadResp, _, err := d.Client.Object.UploadPartCopy(ctx, parsedDestPath, parsedSourcePath, createResp.UploadID, int(i+1), &cos.CopyPartHeaderOptions{
 				XCosCopySource:      fmt.Sprintf("%s/%s", d.Client.BaseURL.BucketURL.Host, parsedSourcePath),
 				XCosCopySourceRange: fmt.Sprintf("bytes=%d-%d", firstByte, lastByte),
 			})
+
+			fmt.Println("[INFO] copy goroutine res")
 
 			if err == nil {
 				parts[i] = cos.Object{
