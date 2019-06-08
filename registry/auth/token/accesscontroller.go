@@ -112,7 +112,11 @@ func (ac authChallenge) challengeParams(r *http.Request) string {
 
 	var parsedRealm bytes.Buffer
 
-	err := t.Execute(&parsedRealm, map[string]string{"Host": r.Host})
+	err := t.Execute(&parsedRealm, map[string]string{
+		"Host":      r.Host,
+		"UserAgent": r.UserAgent(),
+		"Addr":      dcontext.RemoteAddr(r),
+	})
 
 	if err != nil {
 		fmt.Println("[ERROR] execute token realm template error: %s", err)
