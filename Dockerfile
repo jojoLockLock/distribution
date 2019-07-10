@@ -7,6 +7,8 @@ ARG GOOS=linux
 ARG GOARCH=amd64
 ARG GOARM=6
 
+RUN printf "https://mirrors.ustc.edu.cn/alpine/v3.10/main\nhttps://mirrors.ustc.edu.cn/alpine/v3.10/community" > /etc/apk/repositories
+
 RUN set -ex \
     && apk add --no-cache make git file
 
